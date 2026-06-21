@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="wofcli/wofcli.vcxproj" Id="3abd2ef4-cb75-4f11-869d-2684d71f07b9" />
+  <Project Path="woflib/woflib.vcxproj" Id="cf78188b-6a25-4dfd-a4b0-c0c53ca65f0c" />
+</Solution>
