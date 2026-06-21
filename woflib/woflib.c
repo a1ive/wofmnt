@@ -2553,11 +2553,6 @@ static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_
 	{
 		ctx->stats->directories_created++;
 	}
-	err = apply_security(ctx, path, entry->security_id);
-	if (err != ERROR_SUCCESS)
-	{
-		return err;
-	}
 	if (entry->subdir_offset != 0)
 	{
 		size_t child_offset;
@@ -2571,7 +2566,13 @@ static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_
 			return err;
 		}
 	}
-	return apply_times_and_attributes(path, entry);
+	/* Apply image ACLs after population so restrictive system ACLs do not block child creation. */
+	err = apply_times_and_attributes(path, entry);
+	if (err != ERROR_SUCCESS)
+	{
+		return err;
+	}
+	return apply_security(ctx, path, entry->security_id);
 }
 
 static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTRY *entry)
@@ -2593,12 +2594,12 @@ static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTR
 		{
 			ctx->stats->hard_links_created++;
 		}
-		err = apply_security(ctx, path, entry->security_id);
+		err = apply_times_and_attributes(path, entry);
 		if (err != ERROR_SUCCESS)
 		{
 			return err;
 		}
-		return apply_times_and_attributes(path, entry);
+		return apply_security(ctx, path, entry->security_id);
 	}
 
 	err = create_regular_file(ctx, path, entry, &created_primary);
@@ -2614,12 +2615,12 @@ static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTR
 			return err;
 		}
 	}
-	err = apply_security(ctx, path, entry->security_id);
+	err = apply_times_and_attributes(path, entry);
 	if (err != ERROR_SUCCESS)
 	{
 		return err;
 	}
-	return apply_times_and_attributes(path, entry);
+	return apply_security(ctx, path, entry->security_id);
 }
 
 static DWORD apply_entry(APPLY_CONTEXT *ctx, const wchar_t *parent_path, WIM_DENTRY *entry)
@@ -2712,20 +2713,30 @@ static DWORD apply_image_root(APPLY_CONTEXT *ctx)
 	if (!is_terminator && root_entry.name && root_entry.name[0] == L'\0' && root_entry.subdir_offset != 0)
 	{
 		child_offset = (size_t)root_entry.subdir_offset;
-		err = apply_security(ctx, ctx->target_path, root_entry.security_id);
+		err = apply_directory_children(ctx, child_offset, ctx->target_path);
 		if (err == ERROR_SUCCESS)
 		{
-			err = apply_directory_children(ctx, child_offset, ctx->target_path);
+			/* Write the manifest before applying the image root ACL to the target directory. */
+			err = create_manifest(ctx->target_path, ctx->wim_path, ctx->image_index, ctx->data_source_id);
 		}
 		if (err == ERROR_SUCCESS)
 		{
 			err = apply_times_and_attributes(ctx->target_path, &root_entry);
 		}
+		if (err == ERROR_SUCCESS)
+		{
+			err = apply_security(ctx, ctx->target_path, root_entry.security_id);
+		}
 		free_dentry(&root_entry);
 		return err;
 	}
 	free_dentry(&root_entry);
-	return apply_directory_children(ctx, root_offset, ctx->target_path);
+	err = apply_directory_children(ctx, root_offset, ctx->target_path);
+	if (err == ERROR_SUCCESS)
+	{
+		err = create_manifest(ctx->target_path, ctx->wim_path, ctx->image_index, ctx->data_source_id);
+	}
+	return err;
 }
 
 static DWORD delete_tree_contents(const wchar_t *directory_path)
@@ -2943,11 +2954,6 @@ DWORD WofMntMountWim(
 	}
 
 	err = apply_image_root(&ctx);
-	if (err != ERROR_SUCCESS)
-	{
-		goto out;
-	}
-	err = create_manifest(target_io_path, wim_path, image_index, ctx.data_source_id);
 
 out:
 	free_hard_link_table(&ctx.hard_links);
