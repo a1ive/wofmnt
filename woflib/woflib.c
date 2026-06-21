@@ -76,10 +76,13 @@
 #endif
 
 #define WIM_SIGNATURE "MSWIM\0\0"
+#define WIM_VERSION_DEFAULT 0x00010D00u
+#define WIM_HDR_FLAG_COMPRESSION 0x00000002u
 #define WIM_HDR_FLAG_XPRESS 0x00020000u
 #define WIM_HDR_FLAG_LZX 0x00040000u
 #define WIM_HDR_FLAG_LZMS 0x00080000u
 #define WIM_DEFAULT_CHUNK_SIZE 32768u
+#define WOF_MAX_EXTERNAL_BACKING_SIZE UINT64_C(4200000000)
 
 #define WIM_RESHDR_ZLEN_MASK 0x00FFFFFFFFFFFFFFULL
 #define WIM_RESHDR_FLAG_METADATA (0x02ULL << 56)
@@ -229,6 +232,7 @@ typedef struct WIM_STREAM
 	BYTE hash[WIM_PROVIDER_HASH_SIZE];
 	wchar_t *name;
 	uint64_t size;
+	WIM_RESOURCE resource;
 	bool has_resource;
 } WIM_STREAM;
 
@@ -298,6 +302,7 @@ typedef struct APPLY_CONTEXT
 	void *progress_context;
 	WOFMNT_MOUNT_STATS *stats;
 	HARD_LINK_TABLE hard_links;
+	bool wof_external_backing_enabled;
 } APPLY_CONTEXT;
 
 static size_t align8_size(size_t value)
@@ -1040,6 +1045,119 @@ static const WIM_LOOKUP_ITEM *wim_lookup_hash(const WIM_FILE *wim, const BYTE ha
 	return (const WIM_LOOKUP_ITEM *)bsearch(&key, wim->lookup, wim->lookup_count, sizeof(wim->lookup[0]), lookup_compare_hash);
 }
 
+static bool wim_can_use_wof_external_backing(const WIM_FILE *wim, const wchar_t **detail)
+{
+	uint32_t compression_flags;
+
+	if (detail)
+	{
+		*detail = NULL;
+	}
+	if (!wim)
+	{
+		if (detail)
+		{
+			*detail = L"invalid WIM state; materializing file data";
+		}
+		return false;
+	}
+	if (wim->header.version != WIM_VERSION_DEFAULT)
+	{
+		if (detail)
+		{
+			*detail = L"WIM version is not supported by WOF; materializing file data";
+		}
+		return false;
+	}
+
+	compression_flags = wim->header.flags & (WIM_HDR_FLAG_XPRESS | WIM_HDR_FLAG_LZX | WIM_HDR_FLAG_LZMS);
+	if ((wim->header.flags & WIM_HDR_FLAG_COMPRESSION) == 0 || compression_flags == 0)
+	{
+		if (detail)
+		{
+			*detail = L"uncompressed WIM files are not supported by WOF; materializing file data";
+		}
+		return false;
+	}
+	if ((compression_flags & (compression_flags - 1u)) != 0)
+	{
+		if (detail)
+		{
+			*detail = L"WIM compression flags are not supported by WOF; materializing file data";
+		}
+		return false;
+	}
+
+	if ((compression_flags & WIM_HDR_FLAG_XPRESS) != 0)
+	{
+		switch (wim->header.chunk_size)
+		{
+		case 4096u:
+		case 8192u:
+		case 16384u:
+		case 32768u:
+			return true;
+		default:
+			if (detail)
+			{
+				*detail = L"XPRESS WIM chunk size is not supported by WOF; materializing file data";
+			}
+			return false;
+		}
+	}
+	if ((compression_flags & WIM_HDR_FLAG_LZX) != 0 && wim->header.chunk_size == 32768u)
+	{
+		return true;
+	}
+
+	if (detail)
+	{
+		*detail = L"WIM compression type is not supported by WOF; materializing file data";
+	}
+	return false;
+}
+
+static bool stream_can_use_wof_external_backing(const WIM_STREAM *stream, const wchar_t **detail)
+{
+	if (detail)
+	{
+		*detail = NULL;
+	}
+	if (!stream || !stream->has_resource)
+	{
+		if (detail)
+		{
+			*detail = L"file resource is not available for WOF; materializing file data";
+		}
+		return false;
+	}
+	if ((stream->resource.zlen_flags & WIM_RESHDR_FLAG_PACKED_STREAMS) != 0)
+	{
+		if (detail)
+		{
+			*detail = L"packed WIM resources are not supported by WOF; materializing file data";
+		}
+		return false;
+	}
+	if ((stream->resource.zlen_flags & WIM_RESHDR_FLAG_METADATA) != 0)
+	{
+		if (detail)
+		{
+			*detail = L"metadata resources cannot be used as WOF file data; materializing file data";
+		}
+		return false;
+	}
+	if (stream->size > WOF_MAX_EXTERNAL_BACKING_SIZE)
+	{
+		if (detail)
+		{
+			*detail = L"file is too large for WOF external backing; materializing file data";
+		}
+		return false;
+	}
+	return true;
+}
+
 static DWORD wim_open(const wchar_t *wim_path, WIM_FILE *wim)
 {
 	wchar_t *io_path;
@@ -1515,6 +1633,7 @@ static DWORD resolve_stream_resources(APPLY_CONTEXT *ctx, WIM_DENTRY *entry)
 			return ERROR_INVALID_DATA;
 		}
 		stream->size = item->resource.length;
+		stream->resource = item->resource;
 		stream->has_resource = true;
 	}
 	return ERROR_SUCCESS;
@@ -2304,6 +2423,31 @@ static DWORD create_regular_file(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DE
 		return materialize_named_streams(ctx, path, entry, false);
 	}
 
+	{
+		const wchar_t *detail = NULL;
+		bool stream_wof_supported = ctx->wof_external_backing_enabled &&
+			stream_can_use_wof_external_backing(data_stream, &detail);
+
+		if (!stream_wof_supported)
+		{
+			if (ctx->wof_external_backing_enabled && detail)
+			{
+				progress_event(ctx, WOFMNT_PROGRESS_WARNING, path, detail);
+			}
+			err = wim_extract_hash_to_handle(ctx, data_stream->hash, file);
+			CloseHandle(file);
+			if (err == ERROR_SUCCESS && ctx->stats)
+			{
+				ctx->stats->files_materialized++;
+			}
+			if (err != ERROR_SUCCESS)
+			{
+				return err;
+			}
+			return materialize_named_streams(ctx, path, entry, false);
+		}
+	}
+
 	err = WofMntSetWimExternalBacking(file, ctx->data_source_id, data_stream->hash);
 	if (err == ERROR_SUCCESS)
 	{
@@ -2691,6 +2835,7 @@ DWORD WofMntMountWim(
 	WOFMNT_OPTIONS default_options;
 	wchar_t *target_io_path = NULL;
 	wchar_t *wim_full_path = NULL;
+	const wchar_t *wof_detail = NULL;
 	DWORD err = ERROR_SUCCESS;
 	uint32_t wim_type;
 
@@ -2773,12 +2918,24 @@ DWORD WofMntMountWim(
 	}
 	progress_event(&ctx, WOFMNT_PROGRESS_SCANNING_WIM, wim_path, L"security table parsed");
 
-	progress_event(&ctx, WOFMNT_PROGRESS_REGISTERING_WIM, target_directory, wim_path);
-	wim_type = (options->flags & WOFMNT_MOUNT_FLAG_OS_WIM) != 0 ? WIM_BOOT_OS_WIM : WIM_BOOT_NOT_OS_WIM;
-	err = WofMntRegisterWimDataSource(target_directory, wim_path, image_index, wim_type, &ctx.data_source_id);
-	if (err != ERROR_SUCCESS)
+	ctx.wof_external_backing_enabled = wim_can_use_wof_external_backing(&wim, &wof_detail);
+	if (ctx.wof_external_backing_enabled)
 	{
-		goto out;
+		progress_event(&ctx, WOFMNT_PROGRESS_REGISTERING_WIM, target_directory, wim_path);
+		wim_type = (options->flags & WOFMNT_MOUNT_FLAG_OS_WIM) != 0 ? WIM_BOOT_OS_WIM : WIM_BOOT_NOT_OS_WIM;
+		err = WofMntRegisterWimDataSource(target_directory, wim_path, image_index, wim_type, &ctx.data_source_id);
+		if (err != ERROR_SUCCESS)
+		{
+			goto out;
+		}
+	}
+	else
+	{
+		ctx.data_source_id.QuadPart = 0;
+		if (wof_detail)
+		{
+			progress_event(&ctx, WOFMNT_PROGRESS_WARNING, wim_path, wof_detail);
+		}
 	}
 	if (stats)
 	{
@@ -2830,7 +2987,7 @@ DWORD WofMntUnmount(
 	have_manifest = (err == ERROR_SUCCESS);
 
 	err = delete_tree_contents(target_io_path);
-	if (err == ERROR_SUCCESS && have_manifest)
+	if (err == ERROR_SUCCESS && have_manifest && data_source_id.QuadPart != 0)
 	{
 		remove_err = WofMntRemoveWimDataSource(target_directory, data_source_id);
 		if (remove_err != ERROR_SUCCESS)
