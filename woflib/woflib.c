@@ -80,6 +80,9 @@
 #define WIM_HDR_FLAG_XPRESS 0x00020000u
 #define WIM_HDR_FLAG_LZX 0x00040000u
 #define WIM_HDR_FLAG_LZMS 0x00080000u
+#define WIM_HDR_FLAG_XPRESS_2 0x00200000u
+#define WIM_HDR_FLAG_XPRESS_ANY (WIM_HDR_FLAG_XPRESS | WIM_HDR_FLAG_XPRESS_2)
+#define WIM_HDR_FLAG_COMPRESSION_MASK (WIM_HDR_FLAG_XPRESS_ANY | WIM_HDR_FLAG_LZX | WIM_HDR_FLAG_LZMS)
 #define WIM_DEFAULT_CHUNK_SIZE 32768u
 #define WOF_MAX_EXTERNAL_BACKING_SIZE UINT64_C(4200000000)
 
@@ -813,7 +816,7 @@ static DWORD wim_decompress_chunk(
 				   ? ERROR_SUCCESS
 				   : ERROR_INVALID_DATA;
 	}
-	if ((wim->header.flags & WIM_HDR_FLAG_XPRESS) != 0)
+	if ((wim->header.flags & WIM_HDR_FLAG_XPRESS_ANY) != 0)
 	{
 		return wof_wim_xpress_decompress(compressed, compressed_size, uncompressed, expected_size) == 0
 				   ? ERROR_SUCCESS
@@ -1095,6 +1098,7 @@ static const WIM_LOOKUP_ITEM *wim_lookup_hash(const WIM_FILE *wim, const BYTE ha
 static bool wim_can_use_wof_external_backing(const WIM_FILE *wim, const wchar_t **detail)
 {
 	uint32_t compression_flags;
+	unsigned int compression_types = 0;
 
 	if (detail)
 	{
@@ -1117,7 +1121,7 @@ static bool wim_can_use_wof_external_backing(const WIM_FILE *wim, const wchar_t 
 		return false;
 	}
 
-	compression_flags = wim->header.flags & (WIM_HDR_FLAG_XPRESS | WIM_HDR_FLAG_LZX | WIM_HDR_FLAG_LZMS);
+	compression_flags = wim->header.flags & WIM_HDR_FLAG_COMPRESSION_MASK;
 	if ((wim->header.flags & WIM_HDR_FLAG_COMPRESSION) == 0 || compression_flags == 0)
 	{
 		if (detail)
@@ -1126,7 +1130,19 @@ static bool wim_can_use_wof_external_backing(const WIM_FILE *wim, const wchar_t 
 		}
 		return false;
 	}
-	if ((compression_flags & (compression_flags - 1u)) != 0)
+	if ((compression_flags & WIM_HDR_FLAG_XPRESS_ANY) != 0)
+	{
+		compression_types++;
+	}
+	if ((compression_flags & WIM_HDR_FLAG_LZX) != 0)
+	{
+		compression_types++;
+	}
+	if ((compression_flags & WIM_HDR_FLAG_LZMS) != 0)
+	{
+		compression_types++;
+	}
+	if (compression_types != 1u)
 	{
 		if (detail)
 		{
@@ -1135,7 +1151,7 @@ static bool wim_can_use_wof_external_backing(const WIM_FILE *wim, const wchar_t 
 		return false;
 	}
 
-	if ((compression_flags & WIM_HDR_FLAG_XPRESS) != 0)
+	if ((compression_flags & WIM_HDR_FLAG_XPRESS_ANY) != 0)
 	{
 		switch (wim->header.chunk_size)
 		{
@@ -1544,9 +1560,12 @@ static DWORD parse_dentry_at(APPLY_CONTEXT *ctx, size_t offset, WIM_DENTRY *entr
 {
 	const WIM_DENTRY_DISK *disk;
 	uint64_t entry_len64;
+	uint64_t aligned_entry_len64;
 	size_t entry_len;
 	size_t name_offset;
 	size_t short_offset;
+	size_t name_field_size;
+	size_t short_name_field_size;
 	DWORD err;
 
 	ZeroMemory(entry, sizeof(*entry));
@@ -1556,13 +1575,15 @@ static DWORD parse_dentry_at(APPLY_CONTEXT *ctx, size_t offset, WIM_DENTRY *entr
 		return ERROR_INVALID_DATA;
 	}
 	memcpy(&entry_len64, ctx->metadata + offset, sizeof(entry_len64));
-	if (entry_len64 == 0)
+	aligned_entry_len64 = align8_u64(entry_len64);
+	if (aligned_entry_len64 <= sizeof(uint64_t))
 	{
 		*is_terminator = true;
 		*next_offset = offset + sizeof(uint64_t);
 		return ERROR_SUCCESS;
 	}
-	if (!checked_size_from_u64(entry_len64, &entry_len) ||
+	if (aligned_entry_len64 < entry_len64 ||
+		!checked_size_from_u64(aligned_entry_len64, &entry_len) ||
 		entry_len < sizeof(WIM_DENTRY_DISK) ||
 		offset > ctx->metadata_size - entry_len)
 	{
@@ -1574,17 +1595,18 @@ static DWORD parse_dentry_at(APPLY_CONTEXT *ctx, size_t offset, WIM_DENTRY *entr
 		return ERROR_INVALID_DATA;
 	}
 	name_offset = offset + sizeof(WIM_DENTRY_DISK);
-	if ((size_t)disk->name_nbytes + sizeof(wchar_t) > entry_len - sizeof(WIM_DENTRY_DISK))
+	name_field_size = disk->name_nbytes == 0 ? 0u : (size_t)disk->name_nbytes + sizeof(wchar_t);
+	if (name_field_size > entry_len - sizeof(WIM_DENTRY_DISK))
 	{
 		return ERROR_INVALID_DATA;
 	}
-	short_offset = name_offset + (size_t)disk->name_nbytes + sizeof(wchar_t);
+	short_offset = name_offset + name_field_size;
 	if (short_offset < name_offset || short_offset > offset + entry_len)
 	{
 		return ERROR_INVALID_DATA;
 	}
-	if (disk->short_name_nbytes != 0 &&
-		(size_t)disk->short_name_nbytes + sizeof(wchar_t) > (offset + entry_len) - short_offset)
+	short_name_field_size = disk->short_name_nbytes == 0 ? 0u : (size_t)disk->short_name_nbytes + sizeof(wchar_t);
+	if (short_name_field_size > (offset + entry_len) - short_offset)
 	{
 		return ERROR_INVALID_DATA;
 	}
@@ -2043,7 +2065,6 @@ DWORD WofMntRegisterWimDataSource(
 	BYTE *input = NULL;
 	size_t nt_wim_chars;
 	size_t nt_wim_bytes;
-	size_t nt_wim_buffer_bytes;
 	size_t input_size;
 	WOF_EXTERNAL_INFO *wof_info;
 	WIM_PROVIDER_ADD_OVERLAY_INPUT *add_input;
@@ -2097,8 +2118,7 @@ DWORD WofMntRegisterWimDataSource(
 	memcpy(nt_wim_path + 4u, full_wim, (wcslen(full_wim) + 1u) * sizeof(wchar_t));
 
 	nt_wim_bytes = nt_wim_chars * sizeof(wchar_t);
-	nt_wim_buffer_bytes = (nt_wim_chars + 1u) * sizeof(wchar_t);
-	input_size = sizeof(WOF_EXTERNAL_INFO) + sizeof(WIM_PROVIDER_ADD_OVERLAY_INPUT) + nt_wim_buffer_bytes;
+	input_size = sizeof(WOF_EXTERNAL_INFO) + sizeof(WIM_PROVIDER_ADD_OVERLAY_INPUT) + nt_wim_bytes;
 	input = (BYTE *)calloc(1u, input_size);
 	if (!input)
 	{
@@ -2113,7 +2133,7 @@ DWORD WofMntRegisterWimDataSource(
 	add_input->WimIndex = image_index;
 	add_input->WimFileNameOffset = sizeof(*add_input);
 	add_input->WimFileNameLength = (DWORD)nt_wim_bytes;
-	memcpy(add_input + 1, nt_wim_path, nt_wim_buffer_bytes);
+	memcpy(add_input + 1, nt_wim_path, nt_wim_bytes);
 
 	volume = CreateFileW(
 		drive_path,
@@ -2940,7 +2960,7 @@ DWORD WofMntGetWimInfo(const wchar_t *wim_path, WOFMNT_WIM_INFO *info)
 	ZeroMemory(info, sizeof(*info));
 	info->image_count = wim.header.image_count;
 	info->boot_index = wim.header.boot_index;
-	info->compression_flags = wim.header.flags & (WIM_HDR_FLAG_XPRESS | WIM_HDR_FLAG_LZX | WIM_HDR_FLAG_LZMS);
+	info->compression_flags = wim.header.flags & WIM_HDR_FLAG_COMPRESSION_MASK;
 	info->chunk_size = wim.header.chunk_size;
 	memcpy(&info->guid, wim.header.guid, sizeof(info->guid));
 
