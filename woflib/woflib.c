@@ -3053,8 +3053,22 @@ DWORD WofMntMountWim(
 	ctx.progress_context = options->progress_context;
 	ctx.stats = stats;
 
-	progress_event(&ctx, WOFMNT_PROGRESS_SCANNING_WIM, wim_path, L"reading image metadata");
-	err = wim_read_resource_alloc(&wim, &wim.metadata_resources[(size_t)image_index - 1u], &ctx.metadata, &ctx.metadata_size);
+	{
+		WIM_RESOURCE *metadata_resource = &wim.metadata_resources[(size_t)image_index - 1u];
+		wchar_t metadata_detail[160];
+		uint64_t metadata_zlen = metadata_resource->zlen_flags & WIM_RESHDR_ZLEN_MASK;
+
+		_snwprintf_s(
+			metadata_detail,
+			ARRAYSIZE(metadata_detail),
+			_TRUNCATE,
+			L"reading image metadata offset=%llu zlen=%llu size=%llu",
+			(unsigned long long)metadata_resource->offset,
+			(unsigned long long)metadata_zlen,
+			(unsigned long long)metadata_resource->length);
+		progress_event(&ctx, WOFMNT_PROGRESS_SCANNING_WIM, wim_path, metadata_detail);
+		err = wim_read_resource_alloc(&wim, metadata_resource, &ctx.metadata, &ctx.metadata_size);
+	}
 	if (err != ERROR_SUCCESS)
 	{
 		goto out;

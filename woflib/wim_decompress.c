@@ -201,9 +201,23 @@ static uint16_t xca_get16(const uint8_t **src)
 	return v;
 }
 
-static uint8_t xca_get8(const uint8_t **src)
+static uint16_t xca_get16_zero_padded(const uint8_t **src, const uint8_t *end)
 {
-	uint8_t v = **src;
+	if ((size_t)(end - *src) < sizeof(uint16_t))
+	{
+		return 0;
+	}
+	return xca_get16(src);
+}
+
+static uint8_t xca_get8_zero_padded(const uint8_t **src, const uint8_t *end)
+{
+	uint8_t v;
+	if (*src >= end)
+	{
+		return 0;
+	}
+	v = **src;
 	*src += 1;
 	return v;
 }
@@ -226,7 +240,7 @@ int wof_wim_xpress_decompress(
 	memset(&xca, 0, sizeof(xca));
 	xca.alphabet.raw = xca.raw;
 
-	while (src < end && out_len < uncompressed_size)
+	while (out_len < uncompressed_size)
 	{
 		if (out_len >= out_len_threshold)
 		{
@@ -243,11 +257,7 @@ int wof_wim_xpress_decompress(
 			{
 				return -1;
 			}
-			if ((size_t)(end - src) < 4u)
-			{
-				return -1;
-			}
-			accum = ((uint32_t)xca_get16(&src) << 16) | xca_get16(&src);
+			accum = ((uint32_t)xca_get16_zero_padded(&src, end) << 16) | xca_get16_zero_padded(&src, end);
 			extra_bits = 16;
 			out_len_threshold = out_len + XCA_BLOCK_SIZE;
 		}
@@ -262,11 +272,7 @@ int wof_wim_xpress_decompress(
 			extra_bits -= (int)len;
 			if (extra_bits < 0)
 			{
-				if ((size_t)(end - src) < 2u)
-				{
-					return -1;
-				}
-				accum |= (uint32_t)xca_get16(&src) << (-extra_bits);
+				accum |= (uint32_t)xca_get16_zero_padded(&src, end) << (-extra_bits);
 				extra_bits += 16;
 			}
 
@@ -277,10 +283,6 @@ int wof_wim_xpress_decompress(
 					return -1;
 				}
 				out[out_len++] = (uint8_t)raw;
-			}
-			else if (raw == XCA_END_MARKER && src >= end - 1)
-			{
-				return out_len == uncompressed_size ? 0 : -1;
 			}
 			else
 			{
@@ -294,18 +296,10 @@ int wof_wim_xpress_decompress(
 				match_len = raw & 0x0f;
 				if (match_len == 0x0f)
 				{
-					if (src >= end)
-					{
-						return -1;
-					}
-					match_len = xca_get8(&src);
+					match_len = xca_get8_zero_padded(&src, end);
 					if (match_len == 0xff)
 					{
-						if ((size_t)(end - src) < 2u)
-						{
-							return -1;
-						}
-						match_len = xca_get16(&src);
+						match_len = xca_get16_zero_padded(&src, end);
 					}
 					else
 					{
@@ -325,11 +319,7 @@ int wof_wim_xpress_decompress(
 				extra_bits -= (int)match_offset_bits;
 				if (extra_bits < 0)
 				{
-					if ((size_t)(end - src) < 2u)
-					{
-						return -1;
-					}
-					accum |= (uint32_t)xca_get16(&src) << (-extra_bits);
+					accum |= (uint32_t)xca_get16_zero_padded(&src, end) << (-extra_bits);
 					extra_bits += 16;
 				}
 				if (match_offset > out_len || match_len > uncompressed_size - out_len)
