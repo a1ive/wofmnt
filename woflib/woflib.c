@@ -590,7 +590,7 @@ static DWORD get_drive_device_path(const wchar_t *path, wchar_t drive_path[7])
 	return ERROR_SUCCESS;
 }
 
-static DWORD get_drive_letter_path(const wchar_t *path, wchar_t drive_path[3])
+static DWORD get_drive_root_path(const wchar_t *path, wchar_t drive_path[4])
 {
 	wchar_t *full_path = make_full_path_no_prefix(path);
 
@@ -605,7 +605,8 @@ static DWORD get_drive_letter_path(const wchar_t *path, wchar_t drive_path[3])
 	}
 	drive_path[0] = full_path[0];
 	drive_path[1] = L':';
-	drive_path[2] = L'\0';
+	drive_path[2] = L'\\';
+	drive_path[3] = L'\0';
 	free(full_path);
 	return ERROR_SUCCESS;
 }
@@ -2008,14 +2009,14 @@ static DWORD register_wim_data_source_with_api(
 	uint32_t wim_type,
 	LARGE_INTEGER *data_source_id)
 {
-	wchar_t drive_path[3];
+	wchar_t drive_path[4];
 	wchar_t *full_wim = NULL;
 	HMODULE wofutil = NULL;
 	WOF_WIM_ADD_ENTRY_PROC wof_wim_add_entry;
 	HRESULT hr;
 	DWORD err;
 
-	err = get_drive_letter_path(target_directory, drive_path);
+	err = get_drive_root_path(target_directory, drive_path);
 	if (err != ERROR_SUCCESS)
 	{
 		goto out;
@@ -2189,7 +2190,9 @@ DWORD WofMntRegisterWimDataSource(
 
 	if (err != ERROR_SUCCESS)
 	{
-		if (api_err != ERROR_MOD_NOT_FOUND && api_err != ERROR_PROC_NOT_FOUND)
+		if (err == ERROR_INVALID_FUNCTION &&
+			api_err != ERROR_MOD_NOT_FOUND &&
+			api_err != ERROR_PROC_NOT_FOUND)
 		{
 			err = api_err;
 		}
