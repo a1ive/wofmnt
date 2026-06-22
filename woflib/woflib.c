@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #ifndef WIM_PROVIDER_HASH_SIZE
 #define WIM_PROVIDER_HASH_SIZE 20
@@ -283,6 +284,13 @@ typedef struct HARD_LINK_TABLE
 	size_t capacity;
 } HARD_LINK_TABLE;
 
+typedef struct WIM_PATTERN_LIST
+{
+	wchar_t **patterns;
+	size_t count;
+	size_t capacity;
+} WIM_PATTERN_LIST;
+
 typedef struct WIM_FILE
 {
 	HANDLE handle;
@@ -311,6 +319,7 @@ typedef struct APPLY_CONTEXT
 	void *progress_context;
 	WOFMNT_MOUNT_STATS *stats;
 	HARD_LINK_TABLE hard_links;
+	WIM_PATTERN_LIST prepopulate_patterns;
 	bool wof_external_backing_enabled;
 } APPLY_CONTEXT;
 
@@ -517,6 +526,40 @@ static wchar_t *make_child_path(const wchar_t *parent, const wchar_t *name)
 		return NULL;
 	}
 
+	if (parent_len > SIZE_MAX - name_len - (need_slash ? 2u : 1u))
+	{
+		SetLastError(ERROR_OUTOFMEMORY);
+		return NULL;
+	}
+	total_len = parent_len + name_len + (need_slash ? 1u : 0u);
+	out = (wchar_t *)calloc(total_len + 1u, sizeof(wchar_t));
+	if (!out)
+	{
+		SetLastError(ERROR_OUTOFMEMORY);
+		return NULL;
+	}
+	memcpy(out, parent, parent_len * sizeof(wchar_t));
+	if (need_slash)
+	{
+		out[parent_len++] = L'\\';
+	}
+	memcpy(out + parent_len, name, (name_len + 1u) * sizeof(wchar_t));
+	return out;
+}
+
+static wchar_t *make_wim_child_path(const wchar_t *parent, const wchar_t *name)
+{
+	size_t parent_len = wcslen(parent);
+	size_t name_len = wcslen(name);
+	bool need_slash = parent_len == 0 || parent[parent_len - 1u] != L'\\';
+	size_t total_len;
+	wchar_t *out;
+
+	if (name_len == 0 || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':'))
+	{
+		SetLastError(ERROR_INVALID_NAME);
+		return NULL;
+	}
 	if (parent_len > SIZE_MAX - name_len - (need_slash ? 2u : 1u))
 	{
 		SetLastError(ERROR_OUTOFMEMORY);
@@ -1778,6 +1821,48 @@ static void free_hard_link_table(HARD_LINK_TABLE *table)
 	ZeroMemory(table, sizeof(*table));
 }
 
+static void free_pattern_list(WIM_PATTERN_LIST *list)
+{
+	for (size_t i = 0; i < list->count; ++i)
+	{
+		free(list->patterns[i]);
+	}
+	free(list->patterns);
+	ZeroMemory(list, sizeof(*list));
+}
+
+static DWORD pattern_list_add(WIM_PATTERN_LIST *list, const wchar_t *pattern)
+{
+	wchar_t **new_patterns;
+
+	if (!pattern || pattern[0] == L'\0')
+	{
+		return ERROR_SUCCESS;
+	}
+	if (list->count == list->capacity)
+	{
+		size_t new_capacity = list->capacity == 0 ? 16u : list->capacity * 2u;
+		if (new_capacity < list->capacity)
+		{
+			return ERROR_OUTOFMEMORY;
+		}
+		new_patterns = (wchar_t **)realloc(list->patterns, new_capacity * sizeof(list->patterns[0]));
+		if (!new_patterns)
+		{
+			return ERROR_OUTOFMEMORY;
+		}
+		list->patterns = new_patterns;
+		list->capacity = new_capacity;
+	}
+	list->patterns[list->count] = xwcsdup(pattern);
+	if (!list->patterns[list->count])
+	{
+		return ERROR_OUTOFMEMORY;
+	}
+	list->count++;
+	return ERROR_SUCCESS;
+}
+
 static DWORD apply_security(APPLY_CONTEXT *ctx, const wchar_t *path, uint32_t security_id)
 {
 	SECURITY_INFORMATION all_info = OWNER_SECURITY_INFORMATION |
@@ -1953,6 +2038,515 @@ static DWORD wim_extract_hash_alloc(
 		return ERROR_INVALID_DATA;
 	}
 	return wim_read_resource_alloc(ctx->wim, &item->resource, data, data_size);
+}
+
+#define WIMBOOT_COMPRESS_INI_MAX_SIZE (1024u * 1024u)
+
+static bool is_path_separator(wchar_t ch)
+{
+	return ch == L'\\' || ch == L'/';
+}
+
+static wchar_t *trim_wide_inplace(wchar_t *text)
+{
+	wchar_t *end;
+
+	while (*text && iswspace(*text))
+	{
+		text++;
+	}
+	end = text + wcslen(text);
+	while (end > text && iswspace(end[-1]))
+	{
+		*--end = L'\0';
+	}
+	return text;
+}
+
+static void strip_matching_quotes(wchar_t **text)
+{
+	wchar_t *s = *text;
+	size_t len = wcslen(s);
+
+	if (len >= 2u &&
+		((s[0] == L'"' && s[len - 1u] == L'"') ||
+		 (s[0] == L'\'' && s[len - 1u] == L'\'')))
+	{
+		s[len - 1u] = L'\0';
+		*text = s + 1u;
+	}
+}
+
+static void canonicalize_wim_pattern(wchar_t *pattern)
+{
+	wchar_t *src = pattern;
+	wchar_t *dst = pattern;
+	bool previous_separator = false;
+
+	if (!is_path_separator(src[0]) && src[0] != L'\0' && src[1] == L':')
+	{
+		src += 2u;
+	}
+
+	while (*src)
+	{
+		wchar_t ch = *src++;
+		if (is_path_separator(ch))
+		{
+			ch = L'\\';
+			if (previous_separator)
+			{
+				continue;
+			}
+			previous_separator = true;
+		}
+		else
+		{
+			previous_separator = false;
+		}
+		*dst++ = ch;
+	}
+	while (dst > pattern + 1u && dst[-1] == L'\\')
+	{
+		dst--;
+	}
+	*dst = L'\0';
+}
+
+static bool is_valid_prepopulate_pattern(const wchar_t *pattern)
+{
+	if (!pattern || pattern[0] == L'\0')
+	{
+		return false;
+	}
+	if (pattern[0] != L'\\' && wcschr(pattern, L'\\') != NULL)
+	{
+		return false;
+	}
+	return true;
+}
+
+static DWORD multibyte_to_wide_alloc(UINT code_page, DWORD flags, const BYTE *data, size_t size, wchar_t **text)
+{
+	int required;
+	wchar_t *buffer;
+
+	if (size > INT_MAX)
+	{
+		return ERROR_INVALID_DATA;
+	}
+	if (size == 0)
+	{
+		buffer = (wchar_t *)calloc(1u, sizeof(wchar_t));
+		if (!buffer)
+		{
+			return ERROR_OUTOFMEMORY;
+		}
+		*text = buffer;
+		return ERROR_SUCCESS;
+	}
+	required = MultiByteToWideChar(code_page, flags, (LPCCH)data, (int)size, NULL, 0);
+	if (required <= 0)
+	{
+		return last_error_or(ERROR_NO_UNICODE_TRANSLATION);
+	}
+	buffer = (wchar_t *)calloc((size_t)required + 1u, sizeof(wchar_t));
+	if (!buffer)
+	{
+		return ERROR_OUTOFMEMORY;
+	}
+	if (MultiByteToWideChar(code_page, flags, (LPCCH)data, (int)size, buffer, required) <= 0)
+	{
+		DWORD err = last_error_or(ERROR_NO_UNICODE_TRANSLATION);
+		free(buffer);
+		return err;
+	}
+	*text = buffer;
+	return ERROR_SUCCESS;
+}
+
+static DWORD bytes_to_wide_text_alloc(const BYTE *data, size_t size, wchar_t **text)
+{
+	wchar_t *buffer;
+
+	*text = NULL;
+	if (size >= 2u && data[0] == 0xFFu && data[1] == 0xFEu)
+	{
+		size_t bytes = size - 2u;
+		if ((bytes & 1u) != 0)
+		{
+			return ERROR_INVALID_DATA;
+		}
+		buffer = (wchar_t *)calloc((bytes / sizeof(wchar_t)) + 1u, sizeof(wchar_t));
+		if (!buffer)
+		{
+			return ERROR_OUTOFMEMORY;
+		}
+		memcpy(buffer, data + 2u, bytes);
+		*text = buffer;
+		return ERROR_SUCCESS;
+	}
+	if (size >= 2u && data[0] == 0xFEu && data[1] == 0xFFu)
+	{
+		size_t chars = (size - 2u) / 2u;
+		if (((size - 2u) & 1u) != 0)
+		{
+			return ERROR_INVALID_DATA;
+		}
+		buffer = (wchar_t *)calloc(chars + 1u, sizeof(wchar_t));
+		if (!buffer)
+		{
+			return ERROR_OUTOFMEMORY;
+		}
+		for (size_t i = 0; i < chars; ++i)
+		{
+			buffer[i] = (wchar_t)(((uint16_t)data[2u + (i * 2u)] << 8) | data[3u + (i * 2u)]);
+		}
+		*text = buffer;
+		return ERROR_SUCCESS;
+	}
+	if (size >= 3u && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu)
+	{
+		return multibyte_to_wide_alloc(CP_UTF8, MB_ERR_INVALID_CHARS, data + 3u, size - 3u, text);
+	}
+	{
+		DWORD err = multibyte_to_wide_alloc(CP_UTF8, MB_ERR_INVALID_CHARS, data, size, text);
+		if (err == ERROR_SUCCESS)
+		{
+			return ERROR_SUCCESS;
+		}
+	}
+	return multibyte_to_wide_alloc(CP_ACP, 0, data, size, text);
+}
+
+static DWORD parse_prepopulate_patterns(APPLY_CONTEXT *ctx, wchar_t *text)
+{
+	wchar_t *line = text;
+	bool in_prepopulate = false;
+
+	while (*line)
+	{
+		wchar_t *next = line;
+		wchar_t *trimmed;
+
+		while (*next && *next != L'\r' && *next != L'\n')
+		{
+			next++;
+		}
+		if (*next)
+		{
+			*next++ = L'\0';
+			while (*next == L'\r' || *next == L'\n')
+			{
+				*next++ = L'\0';
+			}
+		}
+
+		trimmed = trim_wide_inplace(line);
+		if (trimmed[0] == L'\0' || trimmed[0] == L';' || trimmed[0] == L'#')
+		{
+			line = next;
+			continue;
+		}
+		if (trimmed[0] == L'[')
+		{
+			wchar_t *end = wcschr(trimmed + 1u, L']');
+			if (end)
+			{
+				*end = L'\0';
+				trimmed = trim_wide_inplace(trimmed + 1u);
+				in_prepopulate = _wcsicmp(trimmed, L"PrepopulateList") == 0;
+			}
+			else
+			{
+				in_prepopulate = false;
+			}
+			line = next;
+			continue;
+		}
+		if (in_prepopulate)
+		{
+			DWORD err;
+			strip_matching_quotes(&trimmed);
+			canonicalize_wim_pattern(trimmed);
+			if (is_valid_prepopulate_pattern(trimmed))
+			{
+				err = pattern_list_add(&ctx->prepopulate_patterns, trimmed);
+				if (err != ERROR_SUCCESS)
+				{
+					return err;
+				}
+			}
+		}
+		line = next;
+	}
+	return ERROR_SUCCESS;
+}
+
+static DWORD find_wim_path_in_directory(
+	APPLY_CONTEXT *ctx,
+	size_t directory_offset,
+	const wchar_t *const *components,
+	size_t component_index,
+	size_t component_count,
+	WIM_DENTRY *found_entry)
+{
+	size_t offset = directory_offset;
+
+	while (true)
+	{
+		WIM_DENTRY entry;
+		size_t next_offset = 0;
+		bool is_terminator = false;
+		DWORD err = parse_dentry_at(ctx, offset, &entry, &next_offset, &is_terminator);
+		if (err != ERROR_SUCCESS)
+		{
+			return err;
+		}
+		if (is_terminator)
+		{
+			return ERROR_FILE_NOT_FOUND;
+		}
+
+		if (_wcsicmp(entry.name, components[component_index]) == 0)
+		{
+			if (component_index + 1u == component_count)
+			{
+				*found_entry = entry;
+				return ERROR_SUCCESS;
+			}
+			if ((entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && entry.subdir_offset != 0)
+			{
+				size_t child_offset;
+				if (!checked_size_from_u64(entry.subdir_offset, &child_offset) || child_offset >= ctx->metadata_size)
+				{
+					free_dentry(&entry);
+					return ERROR_INVALID_DATA;
+				}
+				err = find_wim_path_in_directory(
+					ctx,
+					child_offset,
+					components,
+					component_index + 1u,
+					component_count,
+					found_entry);
+				free_dentry(&entry);
+				if (err != ERROR_FILE_NOT_FOUND)
+				{
+					return err;
+				}
+			}
+		}
+		free_dentry(&entry);
+		if (next_offset <= offset || next_offset > ctx->metadata_size)
+		{
+			return ERROR_INVALID_DATA;
+		}
+		offset = next_offset;
+	}
+}
+
+static DWORD find_wim_path_entry(
+	APPLY_CONTEXT *ctx,
+	const wchar_t *const *components,
+	size_t component_count,
+	WIM_DENTRY *found_entry)
+{
+	WIM_DENTRY root_entry;
+	size_t root_offset = ctx->security.total_length;
+	size_t next_offset = 0;
+	bool is_terminator = false;
+	DWORD err;
+
+	if (component_count == 0)
+	{
+		return ERROR_INVALID_PARAMETER;
+	}
+	err = parse_dentry_at(ctx, root_offset, &root_entry, &next_offset, &is_terminator);
+	if (err != ERROR_SUCCESS)
+	{
+		return err;
+	}
+	if (is_terminator || root_entry.subdir_offset == 0)
+	{
+		free_dentry(&root_entry);
+		return ERROR_FILE_NOT_FOUND;
+	}
+	if (!checked_size_from_u64(root_entry.subdir_offset, &root_offset) || root_offset >= ctx->metadata_size)
+	{
+		free_dentry(&root_entry);
+		return ERROR_INVALID_DATA;
+	}
+	err = find_wim_path_in_directory(ctx, root_offset, components, 0, component_count, found_entry);
+	free_dentry(&root_entry);
+	return err;
+}
+
+static DWORD load_wimboot_prepopulate_patterns(APPLY_CONTEXT *ctx)
+{
+	static const wchar_t *const components[] = {
+		L"Windows",
+		L"System32",
+		L"WimBootCompress.ini",
+	};
+	WIM_DENTRY config_entry;
+	WIM_STREAM *data_stream;
+	BYTE *data = NULL;
+	size_t data_size = 0;
+	wchar_t *text = NULL;
+	DWORD err;
+
+	ZeroMemory(&config_entry, sizeof(config_entry));
+	err = find_wim_path_entry(ctx, components, ARRAYSIZE(components), &config_entry);
+	if (err == ERROR_FILE_NOT_FOUND)
+	{
+		return ERROR_SUCCESS;
+	}
+	if (err != ERROR_SUCCESS)
+	{
+		return err;
+	}
+	assign_stream_kinds(&config_entry);
+	err = resolve_stream_resources(ctx, &config_entry);
+	if (err != ERROR_SUCCESS)
+	{
+		goto out;
+	}
+	data_stream = find_stream(&config_entry, STREAM_KIND_DATA, false);
+	if (!data_stream || hash_is_zero(data_stream->hash))
+	{
+		err = ERROR_SUCCESS;
+		goto out;
+	}
+	err = wim_extract_hash_alloc(ctx, data_stream->hash, WIMBOOT_COMPRESS_INI_MAX_SIZE, &data, &data_size);
+	if (err != ERROR_SUCCESS)
+	{
+		goto out;
+	}
+	err = bytes_to_wide_text_alloc(data, data_size, &text);
+	if (err != ERROR_SUCCESS)
+	{
+		goto out;
+	}
+	err = parse_prepopulate_patterns(ctx, text);
+
+out:
+	free(text);
+	free(data);
+	free_dentry(&config_entry);
+	return err;
+}
+
+static const wchar_t *wim_path_basename(const wchar_t *path)
+{
+	const wchar_t *last = wcsrchr(path, L'\\');
+	return last ? last + 1u : path;
+}
+
+static const wchar_t *advance_separators(const wchar_t *text)
+{
+	while (*text == L'\\')
+	{
+		text++;
+	}
+	return text;
+}
+
+static const wchar_t *advance_component(const wchar_t *text)
+{
+	while (*text && *text != L'\\')
+	{
+		text++;
+	}
+	return text;
+}
+
+static bool chars_equal_ignore_case(wchar_t left, wchar_t right)
+{
+	return left == right || towlower(left) == towlower(right);
+}
+
+static bool component_matches_pattern(
+	const wchar_t *text,
+	const wchar_t *text_end,
+	const wchar_t *pattern,
+	const wchar_t *pattern_end)
+{
+	while (text != text_end)
+	{
+		if (pattern == pattern_end)
+		{
+			return false;
+		}
+		if (*pattern == L'*')
+		{
+			return component_matches_pattern(text, text_end, pattern + 1u, pattern_end) ||
+				   component_matches_pattern(text + 1u, text_end, pattern, pattern_end);
+		}
+		if (*pattern != L'?' && !chars_equal_ignore_case(*text, *pattern))
+		{
+			return false;
+		}
+		text++;
+		pattern++;
+	}
+	while (pattern != pattern_end && *pattern == L'*')
+	{
+		pattern++;
+	}
+	return pattern == pattern_end;
+}
+
+static bool wim_path_matches_pattern_recursive(const wchar_t *path, const wchar_t *pattern)
+{
+	if (pattern[0] != L'\\')
+	{
+		path = wim_path_basename(path);
+	}
+	while (true)
+	{
+		const wchar_t *path_end;
+		const wchar_t *pattern_end;
+
+		path = advance_separators(path);
+		pattern = advance_separators(pattern);
+		if (*pattern == L'\0')
+		{
+			return true;
+		}
+		if (*path == L'\0')
+		{
+			return false;
+		}
+		path_end = advance_component(path);
+		pattern_end = advance_component(pattern);
+		if (!component_matches_pattern(path, path_end, pattern, pattern_end))
+		{
+			return false;
+		}
+		path = path_end;
+		pattern = pattern_end;
+	}
+}
+
+static bool wim_path_is_prepopulated(APPLY_CONTEXT *ctx, const wchar_t *wim_path)
+{
+	if (!ctx || !wim_path)
+	{
+		return false;
+	}
+	for (size_t i = 0; i < ctx->prepopulate_patterns.count; ++i)
+	{
+		if (wim_path_matches_pattern_recursive(wim_path, ctx->prepopulate_patterns.patterns[i]))
+		{
+			return true;
+		}
+	}
+	if (wim_path_matches_pattern_recursive(wim_path, L"\\Windows\\System32\\config\\SYSTEM*"))
+	{
+		return true;
+	}
+	return false;
 }
 
 DWORD WofMntSetWimExternalBacking(
@@ -2525,7 +3119,7 @@ static DWORD create_reparse_point(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_D
 	return err;
 }
 
-static DWORD create_regular_file(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTRY *entry, bool *created_primary)
+static DWORD create_regular_file(APPLY_CONTEXT *ctx, const wchar_t *path, const wchar_t *wim_path, WIM_DENTRY *entry, bool *created_primary)
 {
 	WIM_STREAM *data_stream = find_stream(entry, STREAM_KIND_DATA, false);
 	WIM_STREAM *efs_stream = find_stream(entry, STREAM_KIND_EFS_RAW, false);
@@ -2564,6 +3158,7 @@ static DWORD create_regular_file(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DE
 	{
 		const wchar_t *detail = NULL;
 		bool stream_wof_supported = ctx->wof_external_backing_enabled &&
+			!wim_path_is_prepopulated(ctx, wim_path) &&
 			stream_can_use_wof_external_backing(data_stream, &detail);
 
 		if (!stream_wof_supported)
@@ -2676,9 +3271,9 @@ static DWORD create_reparse_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_D
 	return apply_times_and_attributes(path, entry);
 }
 
-static DWORD apply_directory_children(APPLY_CONTEXT *ctx, size_t directory_offset, const wchar_t *directory_path);
+static DWORD apply_directory_children(APPLY_CONTEXT *ctx, size_t directory_offset, const wchar_t *directory_path, const wchar_t *wim_directory_path);
 
-static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTRY *entry)
+static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, const wchar_t *wim_path, WIM_DENTRY *entry)
 {
 	DWORD err;
 
@@ -2698,7 +3293,7 @@ static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_
 		{
 			return ERROR_INVALID_DATA;
 		}
-		err = apply_directory_children(ctx, child_offset, path);
+		err = apply_directory_children(ctx, child_offset, path, wim_path);
 		if (err != ERROR_SUCCESS)
 		{
 			return err;
@@ -2713,7 +3308,7 @@ static DWORD apply_directory_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_
 	return apply_security(ctx, path, entry->security_id);
 }
 
-static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTRY *entry)
+static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, const wchar_t *wim_path, WIM_DENTRY *entry)
 {
 	const wchar_t *first_path = NULL;
 	bool created_primary = false;
@@ -2740,7 +3335,7 @@ static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTR
 		return apply_security(ctx, path, entry->security_id);
 	}
 
-	err = create_regular_file(ctx, path, entry, &created_primary);
+	err = create_regular_file(ctx, path, wim_path, entry, &created_primary);
 	if (err != ERROR_SUCCESS)
 	{
 		return err;
@@ -2761,11 +3356,12 @@ static DWORD apply_file_entry(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DENTR
 	return apply_security(ctx, path, entry->security_id);
 }
 
-static DWORD apply_entry(APPLY_CONTEXT *ctx, const wchar_t *parent_path, WIM_DENTRY *entry)
+static DWORD apply_entry(APPLY_CONTEXT *ctx, const wchar_t *parent_path, const wchar_t *parent_wim_path, WIM_DENTRY *entry)
 {
 	bool is_directory = (entry->attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 	bool is_reparse = (entry->attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 	wchar_t *child_path;
+	wchar_t *child_wim_path;
 	DWORD err;
 
 	if (!entry->name || entry->name[0] == L'\0')
@@ -2777,23 +3373,31 @@ static DWORD apply_entry(APPLY_CONTEXT *ctx, const wchar_t *parent_path, WIM_DEN
 	{
 		return last_error_or(ERROR_INVALID_NAME);
 	}
+	child_wim_path = make_wim_child_path(parent_wim_path, entry->name);
+	if (!child_wim_path)
+	{
+		err = last_error_or(ERROR_INVALID_NAME);
+		free(child_path);
+		return err;
+	}
 	if (is_reparse)
 	{
 		err = create_reparse_entry(ctx, child_path, entry, is_directory);
 	}
 	else if (is_directory)
 	{
-		err = apply_directory_entry(ctx, child_path, entry);
+		err = apply_directory_entry(ctx, child_path, child_wim_path, entry);
 	}
 	else
 	{
-		err = apply_file_entry(ctx, child_path, entry);
+		err = apply_file_entry(ctx, child_path, child_wim_path, entry);
 	}
+	free(child_wim_path);
 	free(child_path);
 	return err;
 }
 
-static DWORD apply_directory_children(APPLY_CONTEXT *ctx, size_t directory_offset, const wchar_t *directory_path)
+static DWORD apply_directory_children(APPLY_CONTEXT *ctx, size_t directory_offset, const wchar_t *directory_path, const wchar_t *wim_directory_path)
 {
 	size_t offset = directory_offset;
 
@@ -2815,7 +3419,7 @@ static DWORD apply_directory_children(APPLY_CONTEXT *ctx, size_t directory_offse
 		err = resolve_stream_resources(ctx, &entry);
 		if (err == ERROR_SUCCESS)
 		{
-			err = apply_entry(ctx, directory_path, &entry);
+			err = apply_entry(ctx, directory_path, wim_directory_path, &entry);
 		}
 		free_dentry(&entry);
 		if (err != ERROR_SUCCESS)
@@ -2851,7 +3455,7 @@ static DWORD apply_image_root(APPLY_CONTEXT *ctx)
 	if (!is_terminator && root_entry.name && root_entry.name[0] == L'\0' && root_entry.subdir_offset != 0)
 	{
 		child_offset = (size_t)root_entry.subdir_offset;
-		err = apply_directory_children(ctx, child_offset, ctx->target_path);
+		err = apply_directory_children(ctx, child_offset, ctx->target_path, L"");
 		if (err == ERROR_SUCCESS)
 		{
 			/* Write the manifest before applying the image root ACL to the target directory. */
@@ -2869,7 +3473,7 @@ static DWORD apply_image_root(APPLY_CONTEXT *ctx)
 		return err;
 	}
 	free_dentry(&root_entry);
-	err = apply_directory_children(ctx, root_offset, ctx->target_path);
+	err = apply_directory_children(ctx, root_offset, ctx->target_path, L"");
 	if (err == ERROR_SUCCESS)
 	{
 		err = create_manifest(ctx->target_path, ctx->wim_path, ctx->image_index, ctx->data_source_id);
@@ -3080,6 +3684,11 @@ DWORD WofMntMountWim(
 		goto out;
 	}
 	progress_event(&ctx, WOFMNT_PROGRESS_SCANNING_WIM, wim_path, L"security table parsed");
+	err = load_wimboot_prepopulate_patterns(&ctx);
+	if (err != ERROR_SUCCESS)
+	{
+		goto out;
+	}
 
 	ctx.wof_external_backing_enabled = wim_can_use_wof_external_backing(&wim, &wof_detail);
 	if (ctx.wof_external_backing_enabled)
@@ -3116,6 +3725,7 @@ DWORD WofMntMountWim(
 
 out:
 	free_hard_link_table(&ctx.hard_links);
+	free_pattern_list(&ctx.prepopulate_patterns);
 	free_security_table(&ctx.security);
 	free(ctx.metadata);
 	wim_close(&wim);
