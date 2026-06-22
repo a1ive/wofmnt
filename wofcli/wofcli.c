@@ -36,7 +36,7 @@ static void print_usage(void)
 	fwprintf(stderr, L"Copyright (C) 2026 A1ive <https://a1ive.github.io/>.\n");
 	fwprintf(stderr, L"Usage:\n");
 	fwprintf(stderr, L"  wofcli info <wim>\n");
-	fwprintf(stderr, L"  wofcli mount <wim> <empty-ntfs-dir> [--index N] [--os-wim] [--no-acl] [--strict-acl] [--materialize-on-wof-fail]\n");
+	fwprintf(stderr, L"  wofcli mount <wim> <empty-ntfs-dir> [--index N] [--os-wim] [--no-acl] [--strict-acl] [--fallback]\n");
 	fwprintf(stderr, L"  wofcli unmount <dir>\n");
 }
 
@@ -379,14 +379,14 @@ static int command_mount(int argc, char **argv)
 		OPT_OS_WIM,
 		OPT_NO_ACL,
 		OPT_STRICT_ACL,
-		OPT_MATERIALIZE_ON_WOF_FAIL
+		OPT_FALLBACK
 	};
 	static const struct optparse_option longopts[] = {
 		{"index", 0, OPTPARSE_REQUIRED},
 		{"os-wim", 0, OPTPARSE_NONE},
 		{"no-acl", 0, OPTPARSE_NONE},
 		{"strict-acl", 0, OPTPARSE_NONE},
-		{"materialize-on-wof-fail", 0, OPTPARSE_NONE},
+		{"fallback", 0, OPTPARSE_NONE},
 		{0, 0, 0},
 	};
 	struct optparse parser;
@@ -442,8 +442,8 @@ static int command_mount(int argc, char **argv)
 		case OPT_STRICT_ACL:
 			options.flags |= WOFMNT_MOUNT_FLAG_STRICT_ACLS;
 			break;
-		case OPT_MATERIALIZE_ON_WOF_FAIL:
-			options.flags |= WOFMNT_MOUNT_FLAG_MATERIALIZE_ON_WOF_FAIL;
+		case OPT_FALLBACK:
+			options.flags |= WOFMNT_MOUNT_FLAG_MATERIALIZE_FALLBACK;
 			break;
 		default:
 			fprintf(stderr, "invalid option\n");

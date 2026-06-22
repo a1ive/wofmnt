@@ -26,7 +26,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -202,6 +201,13 @@ typedef HRESULT(WINAPI *FILTER_ATTACH_PROC)(
 	DWORD dwCreatedInstanceNameLength,
 	LPWSTR lpCreatedInstanceName);
 
+typedef HRESULT(WINAPI *WOF_WIM_ADD_ENTRY_PROC)(
+	PCWSTR VolumeName,
+	PCWSTR WimPath,
+	DWORD WimType,
+	DWORD WimIndex,
+	PLARGE_INTEGER DataSourceId);
+
 typedef enum STREAM_KIND
 {
 	STREAM_KIND_UNKNOWN = 0,
@@ -349,6 +355,19 @@ static DWORD last_error_or(DWORD fallback)
 {
 	DWORD err = GetLastError();
 	return err == ERROR_SUCCESS ? fallback : err;
+}
+
+static DWORD error_from_hresult(HRESULT hr)
+{
+	if (hr == S_OK)
+	{
+		return ERROR_SUCCESS;
+	}
+	if (HRESULT_FACILITY(hr) == FACILITY_WIN32)
+	{
+		return HRESULT_CODE(hr);
+	}
+	return (DWORD)hr;
 }
 
 static bool checked_size_from_u64(uint64_t value, size_t *out)
@@ -568,6 +587,26 @@ static DWORD get_drive_device_path(const wchar_t *path, wchar_t drive_path[7])
 	return ERROR_SUCCESS;
 }
 
+static DWORD get_drive_letter_path(const wchar_t *path, wchar_t drive_path[3])
+{
+	wchar_t *full_path = make_full_path_no_prefix(path);
+
+	if (!full_path)
+	{
+		return last_error_or(ERROR_INVALID_PARAMETER);
+	}
+	if (wcslen(full_path) < 2u || full_path[1] != L':' || full_path[0] == L'\0')
+	{
+		free(full_path);
+		return ERROR_NOT_SUPPORTED;
+	}
+	drive_path[0] = full_path[0];
+	drive_path[1] = L':';
+	drive_path[2] = L'\0';
+	free(full_path);
+	return ERROR_SUCCESS;
+}
+
 static DWORD enable_privilege(const wchar_t *privilege_name)
 {
 	HANDLE token = NULL;
@@ -677,9 +716,10 @@ static DWORD validate_target_directory(const wchar_t *target_path)
 
 static DWORD try_attach_wof(const wchar_t *drive_without_prefix)
 {
+	static const wchar_t *filters[] = {L"WofMob", L"WofAdk", L"Wof"};
 	HMODULE fltlib = LoadLibraryW(L"Fltlib.dll");
 	FILTER_ATTACH_PROC filter_attach;
-	HRESULT hr;
+	HRESULT hr = ERROR_FLT_FILTER_NOT_FOUND;
 
 	if (!fltlib)
 	{
@@ -691,13 +731,20 @@ static DWORD try_attach_wof(const wchar_t *drive_without_prefix)
 		FreeLibrary(fltlib);
 		return ERROR_PROC_NOT_FOUND;
 	}
-	hr = filter_attach(L"wof", drive_without_prefix, NULL, 0, NULL);
-	if (hr != S_OK)
+	for (size_t i = 0; i < ARRAYSIZE(filters); ++i)
 	{
-		hr = filter_attach(L"wofadk", drive_without_prefix, NULL, 0, NULL);
+		hr = filter_attach(filters[i], drive_without_prefix, NULL, 0, NULL);
+		if (SUCCEEDED(hr) || hr == ERROR_FLT_INSTANCE_NAME_COLLISION)
+		{
+			break;
+		}
 	}
 	FreeLibrary(fltlib);
-	return hr == S_OK ? ERROR_SUCCESS : HRESULT_CODE(hr);
+	if (hr == ERROR_FLT_INSTANCE_NAME_COLLISION)
+	{
+		return ERROR_SUCCESS;
+	}
+	return error_from_hresult(hr);
 }
 
 static DWORD read_exact_at(HANDLE file, uint64_t offset, void *buffer, size_t size)
@@ -1932,6 +1979,57 @@ out:
 	return err;
 }
 
+static DWORD register_wim_data_source_with_api(
+	const wchar_t *target_directory,
+	const wchar_t *wim_path,
+	uint32_t image_index,
+	uint32_t wim_type,
+	LARGE_INTEGER *data_source_id)
+{
+	wchar_t drive_path[3];
+	wchar_t *full_wim = NULL;
+	HMODULE wofutil = NULL;
+	WOF_WIM_ADD_ENTRY_PROC wof_wim_add_entry;
+	HRESULT hr;
+	DWORD err;
+
+	err = get_drive_letter_path(target_directory, drive_path);
+	if (err != ERROR_SUCCESS)
+	{
+		goto out;
+	}
+	full_wim = make_full_path_no_prefix(wim_path);
+	if (!full_wim)
+	{
+		err = last_error_or(ERROR_INVALID_PARAMETER);
+		goto out;
+	}
+
+	wofutil = LoadLibraryW(L"Wofutil.dll");
+	if (!wofutil)
+	{
+		err = last_error_or(ERROR_MOD_NOT_FOUND);
+		goto out;
+	}
+	wof_wim_add_entry = (WOF_WIM_ADD_ENTRY_PROC)GetProcAddress(wofutil, "WofWimAddEntry");
+	if (!wof_wim_add_entry)
+	{
+		err = ERROR_PROC_NOT_FOUND;
+		goto out;
+	}
+
+	hr = wof_wim_add_entry(drive_path, full_wim, wim_type, image_index, data_source_id);
+	err = error_from_hresult(hr);
+
+out:
+	if (wofutil)
+	{
+		FreeLibrary(wofutil);
+	}
+	free(full_wim);
+	return err;
+}
+
 DWORD WofMntRegisterWimDataSource(
 	const wchar_t *target_directory,
 	const wchar_t *wim_path,
@@ -1945,16 +2043,24 @@ DWORD WofMntRegisterWimDataSource(
 	BYTE *input = NULL;
 	size_t nt_wim_chars;
 	size_t nt_wim_bytes;
+	size_t nt_wim_buffer_bytes;
 	size_t input_size;
 	WOF_EXTERNAL_INFO *wof_info;
 	WIM_PROVIDER_ADD_OVERLAY_INPUT *add_input;
 	HANDLE volume = INVALID_HANDLE_VALUE;
 	DWORD bytes_returned = 0;
 	DWORD err = ERROR_SUCCESS;
+	DWORD api_err = ERROR_SUCCESS;
 
 	if (!target_directory || !wim_path || !data_source_id || image_index == 0)
 	{
 		err = ERROR_INVALID_PARAMETER;
+		goto fail;
+	}
+
+	api_err = register_wim_data_source_with_api(target_directory, wim_path, image_index, wim_type, data_source_id);
+	if (api_err == ERROR_SUCCESS)
+	{
 		goto fail;
 	}
 
@@ -1991,7 +2097,8 @@ DWORD WofMntRegisterWimDataSource(
 	memcpy(nt_wim_path + 4u, full_wim, (wcslen(full_wim) + 1u) * sizeof(wchar_t));
 
 	nt_wim_bytes = nt_wim_chars * sizeof(wchar_t);
-	input_size = sizeof(WOF_EXTERNAL_INFO) + sizeof(WIM_PROVIDER_ADD_OVERLAY_INPUT) + nt_wim_bytes;
+	nt_wim_buffer_bytes = (nt_wim_chars + 1u) * sizeof(wchar_t);
+	input_size = sizeof(WOF_EXTERNAL_INFO) + sizeof(WIM_PROVIDER_ADD_OVERLAY_INPUT) + nt_wim_buffer_bytes;
 	input = (BYTE *)calloc(1u, input_size);
 	if (!input)
 	{
@@ -2006,7 +2113,7 @@ DWORD WofMntRegisterWimDataSource(
 	add_input->WimIndex = image_index;
 	add_input->WimFileNameOffset = sizeof(*add_input);
 	add_input->WimFileNameLength = (DWORD)nt_wim_bytes;
-	memcpy(add_input + 1, nt_wim_path, nt_wim_bytes);
+	memcpy(add_input + 1, nt_wim_path, nt_wim_buffer_bytes);
 
 	volume = CreateFileW(
 		drive_path,
@@ -2049,6 +2156,10 @@ DWORD WofMntRegisterWimDataSource(
 			{
 				err = ERROR_SUCCESS;
 			}
+			else if (attach_err == ERROR_SUCCESS)
+			{
+				err = last_error_or(ERROR_INVALID_FUNCTION);
+			}
 		}
 	}
 	else
@@ -2058,6 +2169,10 @@ DWORD WofMntRegisterWimDataSource(
 
 	if (err != ERROR_SUCCESS)
 	{
+		if (api_err != ERROR_MOD_NOT_FOUND && api_err != ERROR_PROC_NOT_FOUND)
+		{
+			err = api_err;
+		}
 		goto fail;
 	}
 	if (bytes_returned != sizeof(*data_source_id))
@@ -2459,7 +2574,7 @@ static DWORD create_regular_file(APPLY_CONTEXT *ctx, const wchar_t *path, WIM_DE
 		return materialize_named_streams(ctx, path, entry, false);
 	}
 
-	if ((ctx->flags & WOFMNT_MOUNT_FLAG_MATERIALIZE_ON_WOF_FAIL) == 0)
+	if ((ctx->flags & WOFMNT_MOUNT_FLAG_MATERIALIZE_FALLBACK) == 0)
 	{
 		CloseHandle(file);
 		return err;
@@ -2937,7 +3052,14 @@ DWORD WofMntMountWim(
 		err = WofMntRegisterWimDataSource(target_directory, wim_path, image_index, wim_type, &ctx.data_source_id);
 		if (err != ERROR_SUCCESS)
 		{
-			goto out;
+			if ((options->flags & WOFMNT_MOUNT_FLAG_MATERIALIZE_FALLBACK) == 0)
+			{
+				goto out;
+			}
+			progress_event(&ctx, WOFMNT_PROGRESS_WARNING, wim_path, L"WOF data source registration failed; materializing file data");
+			ctx.wof_external_backing_enabled = false;
+			ctx.data_source_id.QuadPart = 0;
+			err = ERROR_SUCCESS;
 		}
 	}
 	else
