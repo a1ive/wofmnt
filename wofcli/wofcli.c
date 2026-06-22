@@ -53,20 +53,7 @@ static DWORD last_error_or(DWORD fallback)
 
 static void print_error(DWORD err)
 {
-	wchar_t *message = NULL;
-	DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
-				  FORMAT_MESSAGE_FROM_SYSTEM |
-				  FORMAT_MESSAGE_IGNORE_INSERTS;
-
-	if (FormatMessageW(flags, NULL, err, 0, (LPWSTR)&message, 0, NULL) != 0 && message)
-	{
-		fwprintf(stderr, L"error %lu: %ls", err, message);
-		LocalFree(message);
-	}
-	else
-	{
-		fwprintf(stderr, L"error %lu\n", err);
-	}
+	fprintf(stderr, "error %lu\n", err);
 }
 
 static void print_option_error(const struct optparse *parser)
